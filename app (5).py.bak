@@ -1,0 +1,268 @@
+import streamlit as st
+import time
+from pypdf import PdfReader
+
+from rag.embeddings import get_jina_embeddings
+from rag.vision import describe_image
+from rag.chunking import chunk_text
+from rag.retriever import FAISSRetriever
+from rag.reranker import simple_rerank
+from rag.llm import ask_llm
+
+
+st.set_page_config(page_title="Multimodal RAG Assistant", page_icon="🤖", layout="wide")
+
+
+CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=Space+Grotesk:wght@600;700&display=swap');
+:root{
+  --bg-1: #0f172a;
+  --bg-2: #0b1222;
+  --glass: rgba(255,255,255,0.06);
+  --muted: #9aa4b2;
+  --card: rgba(255,255,255,0.02);
+  --accent: #60a5fa;
+  --accent-2: #7c3aed;
+  --radius: 14px;
+}
+body, #root, .appview-container {
+  background: radial-gradient(900px 400px at 10% 10%, #0b122933, transparent 25%),
+              radial-gradient(700px 300px at 92% 15%, #3b82f633, transparent 20%),
+              linear-gradient(180deg,#071126,#081228 60%);
+  color: #e6eef8;
+  font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial;
+}
+.nav{display:flex;align-items:center;justify-content:space-between;padding:18px 22px;background:linear-gradient(90deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border-radius:12px;margin-bottom:18px;border:1px solid rgba(255,255,255,0.03)}
+.brand{display:flex;align-items:center;gap:12px}
+.logo{width:44px;height:44px;border-radius:10px;background:linear-gradient(135deg,var(--accent),var(--accent-2));display:flex;align-items:center;justify-content:center;font-weight:700;color:white}
+.title{font-family:'Space Grotesk',sans-serif;font-size:18px;font-weight:700}
+.subtitle{color:var(--muted);font-size:12px}
+.nav-actions{display:flex;gap:10px;align-items:center}
+.btn{background:linear-gradient(90deg,var(--accent),var(--accent-2));padding:8px 12px;border-radius:10px;border:0;color:#011; font-weight:600;cursor:pointer;box-shadow:0 8px 30px rgba(92, 70, 255, 0.12);transition:transform .12s ease}
+.btn:hover{transform:translateY(-3px)}
+
+.container{max-width:1100px;margin:0 auto}
+.main-grid{display:grid;grid-template-columns: 1fr 360px;gap:20px}
+.panel{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border-radius:var(--radius);padding:18px;border:1px solid rgba(255,255,255,0.03);box-shadow:0 10px 30px rgba(2,6,23,0.6)}
+.uploader{display:flex;flex-direction:column;gap:10px}
+.status-row{display:flex;gap:12px;margin-top:10px}
+.status-pill{padding:8px 12px;border-radius:999px;background:rgba(255,255,255,0.03);color:var(--muted);font-weight:600;font-size:13px}
+
+.chat-area{height:60vh;overflow:auto;padding:14px;display:flex;flex-direction:column;gap:12px}
+.bubble{max-width:78%;padding:12px 14px;border-radius:14px;line-height:1.45}
+.bubble.user{background:linear-gradient(90deg,#0ea5a5,#06b6d4);margin-left:auto;border-bottom-right-radius:4px;color:#021}
+.bubble.bot{background:linear-gradient(180deg, rgba(255,255,255,0.03), rgba(255,255,255,0.02));border-bottom-left-radius:4px;color:#e6eef8}
+.input-row{display:flex;gap:10px;align-items:center;padding-top:8px}
+.query-input{flex:1;padding:12px 14px;border-radius:12px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.03);color:inherit}
+.small{font-size:12px;color:var(--muted)}
+
+/* typing */
+.typing{display:inline-block;height:12px}
+.typing span{display:inline-block;width:6px;height:6px;background:#94a3b8;border-radius:50%;margin-right:6px;animation:blink 1s infinite}
+.typing span:nth-child(2){animation-delay:.15s}
+.typing span:nth-child(3){animation-delay:.3s}
+@keyframes blink{0%{opacity:.2}50%{opacity:1}100%{opacity:.2}}
+
+/* responsive */
+@media (max-width:900px){.main-grid{grid-template-columns:1fr}.panel{padding:12px}}
+"""
+
+st.markdown(f"<style>{CSS}</style>", unsafe_allow_html=True)
+
+
+def _ensure_history():
+    if "history" not in st.session_state:
+        st.session_state.history = []
+
+
+_ensure_history()
+
+
+# Top navigation
+st.markdown(
+    """
+    <div class='nav container'>
+      <div class='brand'>
+        <div class='logo'>AI</div>
+        <div>
+          <div class='title'>Multimodal RAG</div>
+          <div class='subtitle'>Grounded answers for your documents & images</div>
+        </div>
+      </div>
+      <div class='nav-actions'>
+        <button class='btn'>Examples</button>
+        <button class='btn'>Docs</button>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# Layout: main + sidebar
+left, right = st.columns([1, 0.38], gap="large")
+
+with right:
+    st.markdown("<div class='panel'>", unsafe_allow_html=True)
+    st.header("Configuration")
+    groq_key = st.text_input("Groq API Key", type="password")
+    jina_key = st.text_input("Jina API Key", type="password")
+
+    model = st.selectbox("LLM Model", ["llama-3.1-8b-instant", "openai/gpt-oss-120b"])
+    filter_type = st.radio("Retrieval Scope", ["all", "text", "image"], horizontal=True)
+    st.markdown("<div class='small'>Tip: Use <strong>image</strong> scope to test visual grounding.</div>", unsafe_allow_html=True)
+    st.divider()
+    st.markdown("<div class='small'>Recent Uploads</div>", unsafe_allow_html=True)
+    if "last_upload" in st.session_state:
+        st.markdown(f"<div class='small'>• {st.session_state['last_upload']}</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='small'>No uploads yet</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+with left:
+    st.markdown("<div class='container'>", unsafe_allow_html=True)
+    st.markdown("<div class='main-grid'>", unsafe_allow_html=True)
+
+    # Main column
+    main_col, side_col = st.columns([2, 0.0001])
+    with main_col:
+        st.markdown("<div class='panel'>", unsafe_allow_html=True)
+        st.markdown("<h3 style='margin:0 0 8px 0'>Document & Image Upload</h3>", unsafe_allow_html=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            txt_file = st.file_uploader("Upload TXT or PDF", type=["txt", "pdf"], key="doc_uploader")
+            if txt_file:
+                st.success(f"Loaded: {txt_file.name}")
+                st.session_state['last_upload'] = txt_file.name
+        with col2:
+            img_file = st.file_uploader("Upload PNG or JPG", type=["png", "jpg", "jpeg"], key="img_uploader")
+            if img_file:
+                st.success(f"Loaded: {img_file.name}")
+                st.session_state['last_upload'] = img_file.name
+
+        st.markdown("<div class='status-row'>", unsafe_allow_html=True)
+        st.markdown("<div class='status-pill'>Document: " + (txt_file.name if txt_file else "Pending") + "</div>", unsafe_allow_html=True)
+        st.markdown("<div class='status-pill'>Image: " + (img_file.name if img_file else "Optional") + "</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        # Chat panel
+        st.markdown("<div class='panel' style='margin-top:16px'>", unsafe_allow_html=True)
+        st.markdown("<h3 style='margin:0 0 8px 0'>Chat</h3>", unsafe_allow_html=True)
+        chat_area = st.container()
+        with chat_area:
+            chat_box = st.empty()
+            def render_chat():
+                html = ["<div class='chat-area'>"]
+                for q, a in st.session_state.history:
+                    html.append(f"<div class='bubble user'>{st.escape(q)}</div>")
+                    html.append(f"<div class='bubble bot'>{st.escape(a)}</div>")
+                html.append("</div>")
+                chat_box.markdown("".join(html), unsafe_allow_html=True)
+
+            render_chat()
+
+        # Input form
+        st.markdown("<div class='input-row'>", unsafe_allow_html=True)
+        query = st.text_input("", placeholder="Ask a question about the uploaded content...", key="query_input")
+        run = st.button("Send")
+        st.markdown("</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# Helper: show typing indicator
+def _typing_placeholder():
+    t = st.empty()
+    t.markdown("<div class='typing'><span></span><span></span><span></span></div>", unsafe_allow_html=True)
+    return t
+
+
+system_ready = bool(txt_file and groq_key and jina_key)
+
+if not system_ready:
+    st.warning("Provide document and API keys to enable retrieval.")
+
+
+if txt_file and groq_key and jina_key:
+
+    # Process uploads only once — keep logic identical but show progress
+    if "processed" not in st.session_state or st.session_state.get("doc_name") != getattr(txt_file, "name", None):
+        processing = st.empty()
+        with processing.container():
+            st.info("Processing knowledge sources…")
+            progress = st.progress(0)
+            time.sleep(0.15)
+            progress.progress(20)
+
+            if txt_file.name.endswith('.pdf'):
+                reader = PdfReader(txt_file)
+                raw_text = "\n".join([p.extract_text() for p in reader.pages if p.extract_text()])
+            else:
+                raw_text = txt_file.read().decode('utf-8')
+
+            progress.progress(50)
+            chunks = chunk_text(raw_text)
+            metadata = [{"type": "text"} for _ in chunks]
+
+            if img_file:
+                image_bytes = img_file.read()
+                vision_text = describe_image(image_bytes, groq_key)
+                if vision_text:
+                    chunks.append("Image description: " + vision_text)
+                    metadata.append({"type": "image"})
+
+            progress.progress(75)
+            embeddings = get_jina_embeddings(chunks, jina_key)
+            retriever = FAISSRetriever(embeddings, metadata)
+
+            st.session_state['chunks'] = chunks
+            st.session_state['metadata'] = metadata
+            st.session_state['retriever'] = retriever
+            st.session_state['processed'] = True
+            st.session_state['doc_name'] = txt_file.name
+
+            progress.progress(100)
+            processing.success("Processing complete")
+            time.sleep(0.4)
+
+    if run and query:
+        # show typing
+        typing = _typing_placeholder()
+        start = time.time()
+
+        query_emb = get_jina_embeddings([query], jina_key)
+        f = None if filter_type == 'all' else filter_type
+        ids = st.session_state['retriever'].search(query_emb, top_k=5, filter_type=f)
+        retrieved_docs = [st.session_state['chunks'][i] for i in ids]
+        reranked = simple_rerank(query, retrieved_docs)
+        context = "\n\n".join(reranked[:3])
+
+        answer = ask_llm(context, query, groq_key, model)
+        latency = round(time.time() - start, 2)
+
+        # append history and re-render
+        st.session_state.history.append((query, answer))
+        typing.empty()
+
+        # update chat area
+        # reuse render logic
+        chat_html = ["<div class='chat-area'>"]
+        for q, a in st.session_state.history:
+            chat_html.append(f"<div class='bubble user'>{st.escape(q)}</div>")
+            chat_html.append(f"<div class='bubble bot'>{st.escape(a)}</div>")
+        chat_html.append("</div>")
+        st.markdown("".join(chat_html), unsafe_allow_html=True)
+
+        st.metric("Latency (s)", latency)
+        with st.expander("Retrieved Context"):
+            st.text(context)
+
+        with st.expander("Recent Chat History"):
+            for q, a in st.session_state.history[-8:]:
+                st.markdown(f"**Q:** {q}")
+                st.markdown(f"**A:** {a}")
+                st.divider()
+else:
+    # keep the same informational panel when not ready
+    st.info("Upload a document and provide API keys to begin.")
